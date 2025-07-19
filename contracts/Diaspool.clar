@@ -8,9 +8,13 @@
 (define-constant ERR_POOL_NOT_ENDED (err u106))
 (define-constant ERR_ALREADY_WITHDRAWN (err u107))
 (define-constant ERR_NO_CONTRIBUTION (err u108))
+(define-constant ERR_INVALID_REFERRAL (err u109))
+(define-constant ERR_SELF_REFERRAL (err u110))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u111))
 
 (define-data-var next-pool-id uint u1)
 (define-data-var platform-fee-rate uint u250)
+(define-data-var reputation-reward-pool uint u0)
 
 (define-map pools
   { pool-id: uint }
@@ -35,6 +39,93 @@
 (define-map pool-contributors
   { pool-id: uint }
   { contributor-count: uint }
+)
+
+(define-map user-reputation
+  { user: principal }
+  {
+    reputation-score: uint,
+    pools-created: uint,
+    successful-pools: uint,
+    total-contributed: uint,
+    total-pools-contributed: uint,
+    referrals-made: uint,
+    achievement-badges: uint
+  }
+)
+
+(define-map user-referrals
+  { referrer: principal, referee: principal }
+  { referral-bonus: uint, claimed: bool }
+)
+
+(define-map reputation-milestones
+  { milestone-id: uint }
+  {
+    required-score: uint,
+    reward-amount: uint,
+    badge-name: (string-ascii 50),
+    active: bool
+  }
+)
+
+(define-private (update-reputation-on-pool-creation (creator principal))
+  (let
+    (
+      (user-rep (default-to 
+        { reputation-score: u0, pools-created: u0, successful-pools: u0, 
+          total-contributed: u0, total-pools-contributed: u0, referrals-made: u0, achievement-badges: u0 }
+        (map-get? user-reputation { user: creator })))
+    )
+    (map-set user-reputation
+      { user: creator }
+      (merge user-rep { 
+        pools-created: (+ (get pools-created user-rep) u1),
+        reputation-score: (+ (get reputation-score user-rep) u100)
+      })
+    )
+    true
+  )
+)
+
+(define-private (update-reputation-on-contribution (contributor principal) (amount uint))
+  (let
+    (
+      (user-rep (default-to 
+        { reputation-score: u0, pools-created: u0, successful-pools: u0, 
+          total-contributed: u0, total-pools-contributed: u0, referrals-made: u0, achievement-badges: u0 }
+        (map-get? user-reputation { user: contributor })))
+      (contribution-points (/ amount u1000000))
+    )
+    (map-set user-reputation
+      { user: contributor }
+      (merge user-rep { 
+        total-contributed: (+ (get total-contributed user-rep) amount),
+        total-pools-contributed: (+ (get total-pools-contributed user-rep) u1),
+        reputation-score: (+ (get reputation-score user-rep) contribution-points)
+      })
+    )
+    true
+  )
+)
+
+(define-private (update-reputation-on-successful-pool (creator principal))
+  (let
+    (
+      (user-rep (default-to 
+        { reputation-score: u0, pools-created: u0, successful-pools: u0, 
+          total-contributed: u0, total-pools-contributed: u0, referrals-made: u0, achievement-badges: u0 }
+        (map-get? user-reputation { user: creator })))
+    )
+    (map-set user-reputation
+      { user: creator }
+      (merge user-rep { 
+        successful-pools: (+ (get successful-pools user-rep) u1),
+        reputation-score: (+ (get reputation-score user-rep) u500)
+      })
+    )
+    true
+  )
 )
 
 (define-public (create-pool (title (string-ascii 100)) (description (string-ascii 500)) (target-amount uint) (duration-blocks uint))
@@ -67,6 +158,7 @@
     )
     
     (var-set next-pool-id (+ pool-id u1))
+    (update-reputation-on-pool-creation tx-sender)
     (ok pool-id)
   )
 )
@@ -103,6 +195,7 @@
       true
     )
     
+    (update-reputation-on-contribution tx-sender amount)
     (ok true)
   )
 )
@@ -145,6 +238,7 @@
       (merge pool-data { funds-withdrawn: true })
     )
     
+    (update-reputation-on-successful-pool (get creator pool-data))
     (ok creator-amount)
   )
 )
@@ -247,5 +341,157 @@
                    u0
                    (get amount contribution))
     u0
+  )
+)
+
+(define-public (register-with-referral (referrer principal))
+  (let
+    (
+      (referrer-reputation (default-to 
+        { reputation-score: u0, pools-created: u0, successful-pools: u0, 
+          total-contributed: u0, total-pools-contributed: u0, referrals-made: u0, achievement-badges: u0 }
+        (map-get? user-reputation { user: referrer })))
+      (referee-reputation (default-to 
+        { reputation-score: u0, pools-created: u0, successful-pools: u0, 
+          total-contributed: u0, total-pools-contributed: u0, referrals-made: u0, achievement-badges: u0 }
+        (map-get? user-reputation { user: tx-sender })))
+    )
+    (asserts! (not (is-eq tx-sender referrer)) ERR_SELF_REFERRAL)
+    (asserts! (> (get reputation-score referrer-reputation) u0) ERR_INVALID_REFERRAL)
+    
+    (map-set user-referrals
+      { referrer: referrer, referee: tx-sender }
+      { referral-bonus: u50, claimed: false }
+    )
+    
+    (map-set user-reputation
+      { user: referrer }
+      (merge referrer-reputation { 
+        referrals-made: (+ (get referrals-made referrer-reputation) u1),
+        reputation-score: (+ (get reputation-score referrer-reputation) u25)
+      })
+    )
+    
+    (map-set user-reputation
+      { user: tx-sender }
+      (merge referee-reputation { reputation-score: (+ (get reputation-score referee-reputation) u10) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (claim-referral-bonus)
+  (let
+    (
+      (referral-data (unwrap! (map-get? user-referrals { referrer: tx-sender, referee: tx-sender }) ERR_INVALID_REFERRAL))
+      (bonus-amount (get referral-bonus referral-data))
+    )
+    (asserts! (not (get claimed referral-data)) ERR_ALREADY_WITHDRAWN)
+    (asserts! (> bonus-amount u0) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (>= (var-get reputation-reward-pool) bonus-amount) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (as-contract (stx-transfer? bonus-amount tx-sender tx-sender)))
+    
+    (map-set user-referrals
+      { referrer: tx-sender, referee: tx-sender }
+      (merge referral-data { claimed: true })
+    )
+    
+    (var-set reputation-reward-pool (- (var-get reputation-reward-pool) bonus-amount))
+    (ok bonus-amount)
+  )
+)
+
+(define-public (create-reputation-milestone (milestone-id uint) (required-score uint) (reward-amount uint) (badge-name (string-ascii 50)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> required-score u0) ERR_INVALID_AMOUNT)
+    (asserts! (> reward-amount u0) ERR_INVALID_AMOUNT)
+    
+    (map-set reputation-milestones
+      { milestone-id: milestone-id }
+      {
+        required-score: required-score,
+        reward-amount: reward-amount,
+        badge-name: badge-name,
+        active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-milestone-reward (milestone-id uint))
+  (let
+    (
+      (milestone-data (unwrap! (map-get? reputation-milestones { milestone-id: milestone-id }) ERR_POOL_NOT_FOUND))
+      (user-rep (unwrap! (map-get? user-reputation { user: tx-sender }) ERR_NO_CONTRIBUTION))
+      (reward-amount (get reward-amount milestone-data))
+    )
+    (asserts! (get active milestone-data) ERR_POOL_INACTIVE)
+    (asserts! (>= (get reputation-score user-rep) (get required-score milestone-data)) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (>= (var-get reputation-reward-pool) reward-amount) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (as-contract (stx-transfer? reward-amount tx-sender tx-sender)))
+    
+    (map-set user-reputation
+      { user: tx-sender }
+      (merge user-rep { achievement-badges: (+ (get achievement-badges user-rep) u1) })
+    )
+    
+    (var-set reputation-reward-pool (- (var-get reputation-reward-pool) reward-amount))
+    (ok reward-amount)
+  )
+)
+
+(define-public (fund-reputation-rewards (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set reputation-reward-pool (+ (var-get reputation-reward-pool) amount))
+    (ok true)
+  )
+)
+
+(define-public (get-reputation-discount (user principal))
+  (match (map-get? user-reputation { user: user })
+    user-rep (ok (if (>= (get reputation-score user-rep) u1000)
+                   (if (>= (get reputation-score user-rep) u5000)
+                     u50
+                     u25)
+                   u0))
+    (ok u0)
+  )
+)
+
+(define-read-only (get-user-reputation (user principal))
+  (map-get? user-reputation { user: user })
+)
+
+(define-read-only (get-referral-info (referrer principal) (referee principal))
+  (map-get? user-referrals { referrer: referrer, referee: referee })
+)
+
+(define-read-only (get-milestone-info (milestone-id uint))
+  (map-get? reputation-milestones { milestone-id: milestone-id })
+)
+
+(define-read-only (get-reputation-reward-pool-balance)
+  (var-get reputation-reward-pool)
+)
+
+(define-read-only (calculate-reputation-tier (user principal))
+  (match (map-get? user-reputation { user: user })
+    user-rep (ok (if (>= (get reputation-score user-rep) u10000)
+                   "diamond"
+                   (if (>= (get reputation-score user-rep) u5000)
+                     "gold"
+                     (if (>= (get reputation-score user-rep) u1000)
+                       "silver"
+                       "bronze"))))
+    (ok "bronze")
   )
 )
