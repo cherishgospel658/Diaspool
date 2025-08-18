@@ -11,10 +11,15 @@
 (define-constant ERR_INVALID_REFERRAL (err u109))
 (define-constant ERR_SELF_REFERRAL (err u110))
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u111))
+(define-constant ERR_UPDATE_NOT_FOUND (err u112))
+(define-constant ERR_INVALID_UPDATE_TYPE (err u113))
+(define-constant ERR_ALREADY_SUBSCRIBED (err u114))
+(define-constant ERR_NOT_SUBSCRIBED (err u115))
 
 (define-data-var next-pool-id uint u1)
 (define-data-var platform-fee-rate uint u250)
 (define-data-var reputation-reward-pool uint u0)
+(define-data-var next-update-id uint u1)
 
 (define-map pools
   { pool-id: uint }
@@ -67,6 +72,34 @@
     badge-name: (string-ascii 50),
     active: bool
   }
+)
+
+(define-map pool-updates
+  { update-id: uint }
+  {
+    pool-id: uint,
+    creator: principal,
+    title: (string-ascii 100),
+    message: (string-ascii 500),
+    update-type: uint,
+    timestamp: uint,
+    block-height: uint
+  }
+)
+
+(define-map pool-update-count
+  { pool-id: uint }
+  { update-count: uint }
+)
+
+(define-map pool-subscribers
+  { pool-id: uint, subscriber: principal }
+  { subscribed: bool, notification-count: uint }
+)
+
+(define-map subscriber-count
+  { pool-id: uint }
+  { count: uint }
 )
 
 (define-private (update-reputation-on-pool-creation (creator principal))
@@ -495,3 +528,185 @@
     (ok "bronze")
   )
 )
+
+(define-public (post-pool-update (pool-id uint) (title (string-ascii 100)) (message (string-ascii 500)) (update-type uint))
+  (let
+    (
+      (pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (update-id (var-get next-update-id))
+      (current-count (default-to { update-count: u0 } (map-get? pool-update-count { pool-id: pool-id })))
+    )
+    (asserts! (is-eq tx-sender (get creator pool-data)) ERR_UNAUTHORIZED)
+    (asserts! (<= update-type u5) ERR_INVALID_UPDATE_TYPE)
+    (asserts! (> (len title) u0) ERR_INVALID_AMOUNT)
+    (asserts! (> (len message) u0) ERR_INVALID_AMOUNT)
+    
+    (map-set pool-updates
+      { update-id: update-id }
+      {
+        pool-id: pool-id,
+        creator: tx-sender,
+        title: title,
+        message: message,
+        update-type: update-type,
+        timestamp: stacks-block-height,
+        block-height: stacks-block-height
+      }
+    )
+    
+    (map-set pool-update-count
+      { pool-id: pool-id }
+      { update-count: (+ (get update-count current-count) u1) }
+    )
+    
+    (var-set next-update-id (+ update-id u1))
+    (notify-pool-subscribers pool-id)
+    (ok update-id)
+  )
+)
+
+(define-private (notify-pool-subscribers (pool-id uint))
+  (begin
+    true
+  )
+)
+
+(define-public (subscribe-to-pool (pool-id uint))
+  (let
+    (
+      (pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (existing-subscription (map-get? pool-subscribers { pool-id: pool-id, subscriber: tx-sender }))
+      (current-count (default-to { count: u0 } (map-get? subscriber-count { pool-id: pool-id })))
+    )
+    (asserts! (is-none existing-subscription) ERR_ALREADY_SUBSCRIBED)
+    
+    (map-set pool-subscribers
+      { pool-id: pool-id, subscriber: tx-sender }
+      { subscribed: true, notification-count: u0 }
+    )
+    
+    (map-set subscriber-count
+      { pool-id: pool-id }
+      { count: (+ (get count current-count) u1) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (unsubscribe-from-pool (pool-id uint))
+  (let
+    (
+      (pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (subscription (unwrap! (map-get? pool-subscribers { pool-id: pool-id, subscriber: tx-sender }) ERR_NOT_SUBSCRIBED))
+      (current-count (unwrap! (map-get? subscriber-count { pool-id: pool-id }) ERR_NOT_SUBSCRIBED))
+    )
+    (asserts! (get subscribed subscription) ERR_NOT_SUBSCRIBED)
+    
+    (map-set pool-subscribers
+      { pool-id: pool-id, subscriber: tx-sender }
+      { subscribed: false, notification-count: (get notification-count subscription) }
+    )
+    
+    (map-set subscriber-count
+      { pool-id: pool-id }
+      { count: (- (get count current-count) u1) }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (mark-notifications-read (pool-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? pool-subscribers { pool-id: pool-id, subscriber: tx-sender }) ERR_NOT_SUBSCRIBED))
+    )
+    (asserts! (get subscribed subscription) ERR_NOT_SUBSCRIBED)
+    
+    (map-set pool-subscribers
+      { pool-id: pool-id, subscriber: tx-sender }
+      (merge subscription { notification-count: u0 })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (bulk-post-updates (pool-id uint) (updates (list 5 { title: (string-ascii 100), message: (string-ascii 500), update-type: uint })))
+  (let
+    (
+      (pool-data (unwrap! (map-get? pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator pool-data)) ERR_UNAUTHORIZED)
+    
+    (fold process-bulk-update updates { pool-id: pool-id, success: true })
+    (ok true)
+  )
+)
+
+(define-private (process-bulk-update (update { title: (string-ascii 100), message: (string-ascii 500), update-type: uint }) (context { pool-id: uint, success: bool }))
+  (let
+    (
+      (result (post-pool-update (get pool-id context) (get title update) (get message update) (get update-type update)))
+    )
+    (merge context { success: (and (get success context) (is-ok result)) })
+  )
+)
+
+(define-read-only (get-pool-update (update-id uint))
+  (map-get? pool-updates { update-id: update-id })
+)
+
+(define-read-only (get-pool-updates-count (pool-id uint))
+  (default-to { update-count: u0 } (map-get? pool-update-count { pool-id: pool-id }))
+)
+
+(define-read-only (get-pool-subscriber-count (pool-id uint))
+  (default-to { count: u0 } (map-get? subscriber-count { pool-id: pool-id }))
+)
+
+(define-read-only (get-subscription-status (pool-id uint) (subscriber principal))
+  (map-get? pool-subscribers { pool-id: pool-id, subscriber: subscriber })
+)
+
+(define-read-only (is-subscribed-to-pool (pool-id uint) (subscriber principal))
+  (match (map-get? pool-subscribers { pool-id: pool-id, subscriber: subscriber })
+    subscription (get subscribed subscription)
+    false
+  )
+)
+
+(define-read-only (get-update-statistics (pool-id uint))
+  (let
+    (
+      (update-count (get update-count (get-pool-updates-count pool-id)))
+      (sub-count (get count (get-pool-subscriber-count pool-id)))
+    )
+    (ok {
+      total-updates: update-count,
+      total-subscribers: sub-count,
+      updates-per-subscriber: (if (> sub-count u0) (/ update-count sub-count) u0)
+    })
+  )
+)
+
+(define-read-only (get-next-update-id)
+  (var-get next-update-id)
+)
+
+(define-read-only (get-recent-updates-for-pool (pool-id uint) (count uint))
+  (let
+    (
+      (total-updates (get update-count (get-pool-updates-count pool-id)))
+      (start-id (if (> total-updates count) (- total-updates count) u1))
+    )
+    (ok { start-id: start-id, total-updates: total-updates, requested-count: count })
+  )
+)
+
+
+
+
+
+
